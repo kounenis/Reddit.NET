@@ -38,28 +38,52 @@ namespace Reddit.Models.Internal
             RestClient = restClient;
             DeviceId = deviceId;
 
-            string version = "Reddit.NET v" + GetVersion();
-            if (!string.IsNullOrWhiteSpace(userAgent))
-            {
-                version = userAgent + " (via " + version + ")";
-            }
-            RestClient.UserAgent = version;
+            // Force a consistent custom User-Agent (Reddit policy requires identifiable UA).
+            string libVersion = GetVersion();
+            RestClient.UserAgent = ua;
 
             Requests = new List<DateTime>();
         }
 
         public T SendRequest<T>(string url, dynamic parameters, Method method = Method.GET, string contentType = "application/x-www-form-urlencoded")
         {
-            string json = ExecuteRequest(PrepareSendRequest(url, parameters, method, contentType));
+            string json = ExecuteRequestWithDebug(PrepareSendRequest(url, parameters, method, contentType));
 
-            return (json != null ? JsonConvert.DeserializeObject<T>(json) : default(T));
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return default(T);
+            }
+
+            try
+            {
+                return JsonConvert.DeserializeObject<T>(json);
+            }
+            catch (JsonException)
+            {
+                // Provide a clearer diagnostic for upstream callers when Reddit returns non-JSON (e.g., HTML/XML error page / Cloudflare / captcha).
+                var snippet = json.Length > 500 ? json.Substring(0, 500) + "..." : json;
+                throw new RedditException($"Failed to deserialize JSON for URL '{url}'. First snippet: {snippet}");
+            }
         }
 
         public async Task<T> SendRequestAsync<T>(string url, dynamic parameters, Method method = Method.GET, string contentType = "application/x-www-form-urlencoded")
         {
-            string json = await ExecuteRequestAsync(PrepareSendRequest(url, parameters, method, contentType));
+            string json = await ExecuteRequestWithDebugAsync(PrepareSendRequest(url, parameters, method, contentType));
 
-            return (json != null ? JsonConvert.DeserializeObject<T>(json) : default(T));
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return default(T);
+            }
+
+            try
+            {
+                return JsonConvert.DeserializeObject<T>(json);
+            }
+            catch (JsonException)
+            {
+                var snippet = json.Length > 500 ? json.Substring(0, 500) + "..." : json;
+                throw new RedditException($"Failed to deserialize JSON (async) for URL '{url}'. First snippet: {snippet}");
+            }
         }
 
         private RestRequest PrepareSendRequest(string url, dynamic parameters, Method method = Method.GET, string contentType = "application/x-www-form-urlencoded")
@@ -121,6 +145,21 @@ namespace Reddit.Models.Internal
         public RestRequest PrepareRequest(RestRequest restRequest, string contentType = "application/x-www-form-urlencoded")
         {
             restRequest.AddHeader("Authorization", "bearer " + AccessToken);
+
+            // Ensure we explicitly request JSON responses (some environments may default to XML / HTML when Accept header is absent).
+            bool hasAccept = false;
+            foreach (var p in restRequest.Parameters)
+            {
+                if (p.Name.Equals("Accept", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasAccept = true;
+                    break;
+                }
+            }
+            if (!hasAccept)
+            {
+                restRequest.AddHeader("Accept", "application/json; charset=utf-8");
+            }
 
             if (restRequest.Method == Method.POST || restRequest.Method == Method.PUT)
             {
@@ -473,6 +512,221 @@ namespace Reddit.Models.Internal
             {
                 restRequest.AddParameter(name, value);
             }
+        }
+
+        /// <summary>
+        /// Logs detailed information about HTTP requests and responses for debugging purposes.
+        /// </summary>
+        /// <param name="restRequest">The REST request to log details for</param>
+        /// <param name="restResponse">The REST response to log details for (optional)</param>
+        /// <param name="enableVerboseLogging">Whether to enable verbose logging output</param>
+        /// <param name="logToConsole">Whether to output logs to console (default: true)</param>
+        /// <param name="logToFile">Optional file path to write logs to</param>
+        public void LogRequestResponseDetails(RestRequest restRequest, IRestResponse restResponse = null, 
+            bool enableVerboseLogging = true, bool logToConsole = true, string logToFile = null)
+        {
+            if (!enableVerboseLogging) return;
+
+            var logBuilder = new StringBuilder();
+            logBuilder.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] === Reddit.NET Request/Response Debug Log ===");
+            
+            // Log request details
+            if (restRequest != null)
+            {
+                logBuilder.AppendLine("\n--- REQUEST DETAILS ---");
+                logBuilder.AppendLine($"Method: {restRequest.Method}");
+                logBuilder.AppendLine($"Resource: {restRequest.Resource}");
+                logBuilder.AppendLine($"Request Format: {restRequest.RequestFormat}");
+                logBuilder.AppendLine($"Timeout: {restRequest.Timeout}ms");
+                logBuilder.AppendLine($"ReadWriteTimeout: {restRequest.ReadWriteTimeout}ms");
+
+                // Log headers
+                if (restRequest.Parameters != null && restRequest.Parameters.Count > 0)
+                {
+                    logBuilder.AppendLine("\n--- REQUEST HEADERS & PARAMETERS ---");
+                    foreach (var param in restRequest.Parameters)
+                    {
+                        string value = param.Value?.ToString() ?? "null";
+                        
+                        // Mask sensitive information
+                        // if (param.Name.ToLower().Contains("authorization") || 
+                        //     param.Name.ToLower().Contains("token") ||
+                        //     param.Name.ToLower().Contains("password") ||
+                        //     param.Name.ToLower().Contains("secret"))
+                        // {
+                        //     value = "***MASKED***";
+                        // }
+                        
+                        logBuilder.AppendLine($"  {param.Type}: {param.Name} = {value}");
+                    }
+                }
+
+                // Log files if any
+                if (restRequest.Files != null && restRequest.Files.Count > 0)
+                {
+                    logBuilder.AppendLine("\n--- REQUEST FILES ---");
+                    foreach (var file in restRequest.Files)
+                    {
+                        logBuilder.AppendLine($"  File: {file.Name}, Length: {file.ContentLength} bytes, Type: {file.ContentType}");
+                    }
+                }
+
+                // Log full URL (constructed)
+                string baseUrl = RestClient?.BaseUrl?.ToString() ?? "Unknown";
+                logBuilder.AppendLine($"\nFull URL: {baseUrl}{restRequest.Resource}");
+            }
+
+            // Log response details
+            if (restResponse != null)
+            {
+                logBuilder.AppendLine("\n--- RESPONSE DETAILS ---");
+                logBuilder.AppendLine($"Status Code: {restResponse.StatusCode} ({(int)restResponse.StatusCode})");
+                logBuilder.AppendLine($"Status Description: {restResponse.StatusDescription}");
+                logBuilder.AppendLine($"Content Type: {restResponse.ContentType}");
+                logBuilder.AppendLine($"Content Length: {restResponse.ContentLength}");
+                logBuilder.AppendLine($"Content Encoding: {restResponse.ContentEncoding}");
+                logBuilder.AppendLine($"Server: {restResponse.Server}");
+                logBuilder.AppendLine($"Protocol Version: {restResponse.ProtocolVersion}");
+                logBuilder.AppendLine($"Is Successful: {restResponse.IsSuccessful}");
+                logBuilder.AppendLine($"Error Message: {restResponse.ErrorMessage ?? "None"}");
+                logBuilder.AppendLine($"Error Exception: {restResponse.ErrorException?.ToString() ?? "None"}");
+
+                // Log response headers
+                if (restResponse.Headers != null && restResponse.Headers.Count > 0)
+                {
+                    logBuilder.AppendLine("\n--- RESPONSE HEADERS ---");
+                    foreach (var header in restResponse.Headers)
+                    {
+                        logBuilder.AppendLine($"  {header.Name}: {header.Value}");
+                    }
+                }
+
+                // Log response cookies
+                if (restResponse.Cookies != null && restResponse.Cookies.Count > 0)
+                {
+                    logBuilder.AppendLine("\n--- RESPONSE COOKIES ---");
+                    foreach (var cookie in restResponse.Cookies)
+                    {
+                        logBuilder.AppendLine($"  {cookie.Name}: {cookie.Value} (Domain: {cookie.Domain}, Path: {cookie.Path})");
+                    }
+                }
+
+                // Log response content (with size limit for readability)
+                if (!string.IsNullOrEmpty(restResponse.Content))
+                {
+                    logBuilder.AppendLine("\n--- RESPONSE CONTENT ---");
+                    string content = restResponse.Content;
+                    
+                    // Limit content size for logging (first 2000 characters)
+                    if (content.Length > 2000)
+                    {
+                        content = content.Substring(0, 2000) + $"\n... [Content truncated. Total length: {restResponse.Content.Length} characters]";
+                    }
+                    
+                    // Try to format JSON for better readability
+                    try
+                    {
+                        if (restResponse.ContentType?.Contains("application/json") == true || 
+                            (content.TrimStart().StartsWith("{") || content.TrimStart().StartsWith("[")))
+                        {
+                            var jsonObj = JsonConvert.DeserializeObject(content);
+                            content = JsonConvert.SerializeObject(jsonObj, Formatting.Indented);
+                        }
+                    }
+                    catch
+                    {
+                        // If JSON formatting fails, use original content
+                    }
+                    
+                    logBuilder.AppendLine(content);
+                }
+
+                // Log timing information if available
+                if (restResponse.ResponseUri != null)
+                {
+                    logBuilder.AppendLine($"\nResponse URI: {restResponse.ResponseUri}");
+                }
+            }
+
+            logBuilder.AppendLine("\n=== End Debug Log ===\n");
+
+            string logOutput = logBuilder.ToString();
+
+            // Output to console
+            if (logToConsole)
+            {
+                Console.WriteLine(logOutput);
+            }
+
+            // Output to file
+            if (!string.IsNullOrEmpty(logToFile))
+            {
+                try
+                {
+                    System.IO.File.AppendAllText(logToFile, logOutput);
+                }
+                catch (Exception ex)
+                {
+                    if (logToConsole)
+                    {
+                        Console.WriteLine($"Failed to write to log file '{logToFile}': {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Executes a request with verbose debugging enabled.
+        /// </summary>
+        /// <param name="restRequest">The request to execute</param>
+        /// <param name="logToConsole">Whether to log to console</param>
+        /// <param name="logToFile">Optional file path to log to</param>
+        /// <returns>The response content as string</returns>
+        public string ExecuteRequestWithDebug(RestRequest restRequest, bool logToConsole = true, string logToFile = null)
+        {
+            // Log request details before execution
+            LogRequestResponseDetails(restRequest, null, true, logToConsole, logToFile);
+
+            // Execute the request
+            int ratelimitRetry = 100;
+            IRestResponse res;
+            do
+            {
+                res = GetResponse(RestClient.Execute(PrepareExecuteRequest(restRequest)), ref restRequest);
+                CheckAuthRequired(res);
+            } while (IsRateLimited(res, ref ratelimitRetry) && ratelimitRetry > 0);
+
+            // Log response details after execution
+            LogRequestResponseDetails(restRequest, res, true, logToConsole, logToFile);
+
+            return ProcessResponse(res);
+        }
+
+        /// <summary>
+        /// Executes a request asynchronously with verbose debugging enabled.
+        /// </summary>
+        /// <param name="restRequest">The request to execute</param>
+        /// <param name="logToConsole">Whether to log to console</param>
+        /// <param name="logToFile">Optional file path to log to</param>
+        /// <returns>The response content as string</returns>
+        public async Task<string> ExecuteRequestWithDebugAsync(RestRequest restRequest, bool logToConsole = true, string logToFile = null)
+        {
+            // Log request details before execution
+            LogRequestResponseDetails(restRequest, null, true, logToConsole, logToFile);
+
+            // Execute the request
+            int ratelimitRetry = 100;
+            IRestResponse res;
+            do
+            {
+                res = GetResponse(await RestClient.ExecuteTaskAsync(PrepareExecuteRequest(restRequest)), ref restRequest);
+                CheckAuthRequired(res);
+            } while (IsRateLimited(res, ref ratelimitRetry) && ratelimitRetry > 0);
+
+            // Log response details after execution
+            LogRequestResponseDetails(restRequest, res, true, logToConsole, logToFile);
+
+            return ProcessResponse(res);
         }
     }
 }
