@@ -46,6 +46,8 @@ namespace Reddit.Models.Internal
             RestClient.UserAgent = version;
 
             Requests = new List<DateTime>();
+
+            this.RefreshAccessToken(null);
         }
 
         public T SendRequest<T>(string url, dynamic parameters, Method method = Method.GET, string contentType = "application/x-www-form-urlencoded")
@@ -448,6 +450,10 @@ namespace Reddit.Models.Internal
                 };
                 OnTokenUpdated(args);
 
+                if (restRequest == null)
+                {
+                    return null;
+                }
                 string contentType = "application/x-www-form-urlencoded";
                 foreach (Parameter param in restRequest.Parameters)
                 {
