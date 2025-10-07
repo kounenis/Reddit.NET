@@ -21,6 +21,13 @@ namespace Reddit.Models.Internal
         public event EventHandler<TokenUpdateEventArgs> TokenUpdated;
         public event EventHandler<RequestsUpdateEventArgs> RequestsUpdated;
 
+        // Rate limit tracking based on Reddit response headers
+        private readonly object _rateLimitLock = new object();
+        private int _rateLimitUsed = 0;
+        private int _rateLimitRemaining = 60;
+        private int _rateLimitResetSeconds = 60;
+        private DateTime _lastRequestTime = DateTime.MinValue;
+
         internal abstract string AppId { get; set; }
         internal abstract string AppSecret { get; set; }
         internal abstract string AccessToken { get; set; }
@@ -97,7 +104,7 @@ namespace Reddit.Models.Internal
 
             return PrepareRequest(restRequest, contentType);
         }
-        
+
         public RestRequest PrepareRequest(string url, Method method, List<Parameter> parameters, List<FileParameter> files,
             string contentType = "application/x-www-form-urlencoded")
         {
@@ -135,7 +142,7 @@ namespace Reddit.Models.Internal
         public string GetVersion()
         {
             string res = Assembly.GetExecutingAssembly().GetName().Version.ToString();
-            return (string.IsNullOrWhiteSpace(res) || !res.Contains(".") ? res : res.Substring(0, res.LastIndexOf(".")) + 
+            return (string.IsNullOrWhiteSpace(res) || !res.Contains(".") ? res : res.Substring(0, res.LastIndexOf(".")) +
                 (res.EndsWith(".1") ? "+develop" : res.EndsWith(".2") ? "+beta" : ""));
         }
 
@@ -151,6 +158,9 @@ namespace Reddit.Models.Internal
 
         private RestRequest PrepareExecuteRequest(RestRequest restRequest)
         {
+            // Wait if rate limit is close to being exceeded based on Reddit headers
+            WaitRateLimit();
+
             // If we've reached the speed limit, hold until we're clear to proceed.  --Kris
             while (!RequestReady())
             {
@@ -167,6 +177,9 @@ namespace Reddit.Models.Internal
 
         private IRestResponse GetResponse(IRestResponse res, ref RestRequest restRequest)
         {
+            // Update rate limit information from response headers
+            UpdateRateLimitFromHeaders(res);
+
             int serviceRetry = 3;
             do
             {
@@ -372,6 +385,87 @@ namespace Reddit.Models.Internal
         public void UpdateRequests(List<DateTime> requests)
         {
             Requests = requests;
+        }
+
+        private void UpdateRateLimitFromHeaders(IRestResponse response)
+        {
+            if (response?.Headers == null)
+            {
+                return;
+            }
+
+            lock (_rateLimitLock)
+            {
+                _lastRequestTime = DateTime.UtcNow;
+
+                foreach (var header in response.Headers)
+                {
+                    if (header.Name.Equals("x-ratelimit-used", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(header.Value?.ToString(), out int used))
+                        {
+                            _rateLimitUsed = used;
+                        }
+                    }
+                    else if (header.Name.Equals("x-ratelimit-remaining", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (double.TryParse(header.Value?.ToString(), out double remaining))
+                        {
+                            _rateLimitRemaining = (int)Math.Floor(remaining);
+                        }
+                    }
+                    else if (header.Name.Equals("x-ratelimit-reset", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(header.Value?.ToString(), out int reset))
+                        {
+                            _rateLimitResetSeconds = reset;
+                        }
+                    }
+                }
+
+            }
+            Console.WriteLine($"Rate Limit Used: {_rateLimitUsed}, Remaining: {_rateLimitRemaining}, Reset Seconds: {_rateLimitResetSeconds}");
+        }
+
+
+        private void WaitRateLimit()
+        {
+            int waitMilliseconds = 0;
+
+            lock (_rateLimitLock)
+            {
+                // If we have at least 5 requests remaining, we're good to proceed
+                if (_rateLimitRemaining >= 5)
+                {
+                    return;
+                }
+
+                // Calculate when the rate limit will reset
+                DateTime resetTime = _lastRequestTime.AddSeconds(_rateLimitResetSeconds);
+                DateTime now = DateTime.UtcNow;
+
+                // If reset time is in the past, the limit has already reset
+                if (resetTime <= now)
+                {
+                    return;
+                }
+
+                // Calculate how long to wait
+                TimeSpan waitTime = resetTime - now;
+                waitMilliseconds = (int)waitTime.TotalMilliseconds;
+
+                if (waitMilliseconds > 0)
+                {
+                    // Add a small buffer to ensure we're past the reset time
+                    waitMilliseconds += 1000;
+                }
+            }
+
+            // Sleep outside the lock to avoid blocking other threads
+            if (waitMilliseconds > 0)
+            {
+                Thread.Sleep(waitMilliseconds);
+            }
         }
 
         internal bool RequestReady(int maxRequests = 60)
